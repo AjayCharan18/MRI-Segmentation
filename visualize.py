@@ -1,119 +1,128 @@
+import argparse
 import os
-import torch
-import numpy as np
+
 import matplotlib.pyplot as plt
-from model import UNet
+import numpy as np
+import torch
+
+from config import load_config
 from data_loader import MRIDataset
+from model import UNet
+from utils import dice_coefficient, threshold_predictions
 
-# Device configuration
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def dice_score(pred, target, smooth=1e-5):
-    """Calculate Dice score between prediction and target."""
-    intersection = (pred * target).sum()
-    return (2.0 * intersection + smooth) / (pred.sum() + target.sum() + smooth)
+def visualize_predictions(
+    model: UNet,
+    dataset: MRIDataset,
+    device: str,
+    num_samples: int,
+    num_slices: int,
+    threshold: float,
+) -> None:
+    """Visualize predictions and ground-truth masks for a subset of samples."""
 
-def visualize_predictions(model, dataset, num_samples=3, num_slices=3, threshold=0.7):
-    """
-    Visualize multiple samples and slices from the dataset and classify tumor presence.
-    
-    Args:
-        model: Trained model.
-        dataset: Dataset object.
-        num_samples: Number of samples to visualize.
-        num_slices: Number of slices to visualize per sample.
-        threshold: Threshold for binary predictions.
-    """
     model.eval()
 
-    for sample_idx in range(num_samples):
+    for sample_idx in range(min(num_samples, len(dataset))):
         img, mask = dataset[sample_idx]
+        img = img.unsqueeze(0).to(device)
+        mask = mask.to(device)
 
-        # Debug: Print image and mask shapes and values
-        print(f"Sample {sample_idx + 1}")
-        print(f"Image shape: {img.shape}, Min: {img.min()}, Max: {img.max()}")
-        print(f"Mask shape: {mask.shape}, Min: {mask.min()}, Max: {mask.max()}")
-
-        # Move data to the appropriate device
-        img = img.unsqueeze(0).to(DEVICE)  # Add batch dimension
-        mask = mask.to(DEVICE)
-
-        # Get model prediction
         with torch.no_grad():
-            raw_pred = model(img)  # Get raw model output
-            print(f"Raw prediction: Min: {raw_pred.min()}, Max: {raw_pred.max()}")
-            pred = torch.sigmoid(raw_pred)  # Apply sigmoid to get probabilities
+            logits = model(img)
+            preds = threshold_predictions(logits, threshold)
 
-            # Debug: Print histogram of raw predictions
-            print(f"Raw prediction histogram: {torch.histc(raw_pred, bins=10, min=0, max=1)}")
+        tumor_present = preds.sum() > 0
 
-            # Apply threshold to get binary predictions
-            pred = (pred > threshold).float()
+        img_np = img.cpu().squeeze().numpy()
+        mask_np = mask.cpu().squeeze().numpy()
+        pred_np = preds.cpu().squeeze().numpy()
 
-        # Check if tumor is present
-        tumor_present = pred.sum() > 0  # If any pixel is above the threshold
-        print(f"Tumor Present: {'Yes' if tumor_present else 'No'}")
+        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
 
-        # Move data back to CPU for visualization
-        img = img.cpu().squeeze().numpy()
-        mask = mask.cpu().squeeze().numpy()
-        pred = pred.cpu().squeeze().numpy()
-
-        # Normalize the input image for better visualization
-        img = (img - img.min()) / (img.max() - img.min())
-
-        # Visualize multiple slices
-        depth = img.shape[-1]
-        slice_indices = np.linspace(0, depth - 1, num_slices, dtype=int)  # Get evenly spaced slices
+        depth = img_np.shape[-1]
+        slice_indices = np.linspace(0, depth - 1, num_slices, dtype=int)
 
         for slice_idx in slice_indices:
-            img_slice = img[:, :, slice_idx]
-            mask_slice = mask[:, :, slice_idx]
-            pred_slice = pred[:, :, slice_idx]
+            img_slice = img_np[:, :, slice_idx]
+            mask_slice = mask_np[:, :, slice_idx]
+            pred_slice = pred_np[:, :, slice_idx]
 
-            # Calculate Dice score
-            dice = dice_score(pred_slice, mask_slice)
-            print(f"Slice {slice_idx + 1}, Dice Score: {dice:.4f}")
+            dice = dice_coefficient(
+                torch.tensor(pred_slice).unsqueeze(0).unsqueeze(0),
+                torch.tensor(mask_slice).unsqueeze(0).unsqueeze(0),
+            ).item()
 
-            # Debug: Print slice shapes and values
-            print(f"Image slice shape: {img_slice.shape}, Min: {img_slice.min()}, Max: {img_slice.max()}")
-            print(f"Mask slice shape: {mask_slice.shape}, Min: {mask_slice.min()}, Max: {mask_slice.max()}")
-            print(f"Prediction slice shape: {pred_slice.shape}, Min: {pred_slice.min()}, Max: {pred_slice.max()}")
-
-            # Plot the results
             plt.figure(figsize=(12, 4))
+            plt.suptitle(
+                f"Sample {sample_idx + 1} | Slice {slice_idx + 1} | Tumor: {'Yes' if tumor_present else 'No'} | Dice: {dice:.3f}"
+            )
 
-            # Input MRI
             plt.subplot(1, 3, 1)
-            plt.title(f"Input MRI (Slice {slice_idx + 1})")
+            plt.title("Input MRI")
             plt.imshow(img_slice, cmap="gray")
             plt.axis("off")
 
-            # Ground Truth
             plt.subplot(1, 3, 2)
-            plt.title(f"Ground Truth (Slice {slice_idx + 1})")
+            plt.title("Ground Truth")
             plt.imshow(mask_slice, cmap="gray")
             plt.axis("off")
 
-            # Prediction
             plt.subplot(1, 3, 3)
-            plt.title(f"Prediction (Slice {slice_idx + 1}, Tumor: {'Yes' if tumor_present else 'No'})")
-            plt.imshow(pred_slice, cmap="binary")  # Use binary colormap for better visualization
+            plt.title("Prediction")
+            plt.imshow(pred_slice, cmap="binary")
             plt.axis("off")
 
+            plt.tight_layout()
             plt.show()
 
-if __name__ == '__main__':
-    # Load the trained model
-    model = UNet().to(DEVICE)
-    model.load_state_dict(torch.load("best_model.pth", map_location=DEVICE))
 
-    # Dataset directory
-    DATASET_DIR = "C:/Users/Dell/Downloads/mri segmentation/data"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Visualize MRI segmentation predictions.")
+    parser.add_argument("--config", type=str, default=None, help="Optional path to YAML config file.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
+    parser.add_argument("--num-samples", type=int, default=3, help="Number of volumes to visualize.")
+    parser.add_argument("--num-slices", type=int, default=3, help="Number of slices per volume.")
+    parser.add_argument("--threshold", type=float, default=None, help="Prediction threshold override.")
+    return parser.parse_args()
 
-    # Filter out invalid entries (e.g., .DS_Store)
-    patients = [p for p in os.listdir(DATASET_DIR) if os.path.isdir(os.path.join(DATASET_DIR, p))]
-    dataset = MRIDataset(DATASET_DIR, patients=patients)
 
-    # Visualize multiple samples and slices
-    visualize_predictions(model, dataset, num_samples=3, num_slices=3, threshold=0.7)  # Visualize 3 samples and 3 slices per sample
+def main() -> None:
+    args = parse_args()
+    config = load_config(args.config)
+    device = config.resolve_device()
+
+    checkpoint_path = args.checkpoint or config.checkpoint_path
+    if not checkpoint_path:
+        raise ValueError("Checkpoint path must be provided via --checkpoint or config file.")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("model_state", checkpoint)
+
+    model = UNet().to(device)
+    model.load_state_dict(state_dict)
+
+    threshold = args.threshold if args.threshold is not None else config.threshold
+
+    patients = sorted(config.extra.get("patients", [])) or None
+    if patients is None:
+        patients = [
+            entry
+            for entry in os.listdir(config.data_dir)
+            if os.path.isdir(os.path.join(config.data_dir, entry))
+        ]
+
+    dataset = MRIDataset(config.data_dir, patients=patients, augment=False)
+
+    visualize_predictions(
+        model=model,
+        dataset=dataset,
+        device=device,
+        num_samples=args.num_samples,
+        num_slices=args.num_slices,
+        threshold=threshold,
+    )
+
+
+if __name__ == "__main__":
+    main()

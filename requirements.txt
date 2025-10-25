@@ -1,0 +1,11 @@
+torch
+numpy
+nibabel
+scikit-image
+scikit-learn
+tqdm
+matplotlib
+pyyaml
+tensorboard
+wandb
+pytest
